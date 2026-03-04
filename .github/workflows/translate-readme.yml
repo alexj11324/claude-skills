@@ -1,0 +1,188 @@
+name: Translate README (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      source_lang:
+        description: 'Source language of the README (e.g., en, zh)'
+        required: false
+        type: string
+        default: 'auto'
+      target_langs:
+        description: 'Comma-separated target languages (e.g., zh,en,ja)'
+        required: false
+        type: string
+        default: 'zh,en'
+      model:
+        description: 'Vertex AI model to use'
+        required: false
+        type: string
+        default: 'gemini-2.0-flash'
+      gcp_region:
+        description: 'GCP region for Vertex AI'
+        required: false
+        type: string
+        default: 'us-central1'
+    secrets:
+      GCP_CREDENTIALS:
+        required: true
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install google-cloud-aiplatform
+
+      - name: Detect source language and translate
+        env:
+          TARGET_LANGS: ${{ inputs.target_langs }}
+          SOURCE_LANG: ${{ inputs.source_lang }}
+          MODEL: ${{ inputs.model }}
+          GCP_REGION: ${{ inputs.gcp_region }}
+        run: |
+          cat << 'PYTHON_SCRIPT' > /tmp/translate_readme.py
+          import os
+          import sys
+          import json
+          import re
+
+          from google.cloud import aiplatform
+          from vertexai.generative_models import GenerativeModel
+
+          import vertexai
+
+          def detect_language(text: str) -> str:
+              """Simple heuristic to detect if text is primarily Chinese or English."""
+              chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+              total_alpha = len(re.findall(r'[a-zA-Z]', text))
+              if chinese_chars > total_alpha:
+                  return 'zh'
+              return 'en'
+
+          LANG_NAMES = {
+              'zh': 'Simplified Chinese (简体中文)',
+              'en': 'English',
+              'ja': 'Japanese (日本語)',
+              'ko': 'Korean (한국어)',
+              'fr': 'French (Français)',
+              'de': 'German (Deutsch)',
+              'es': 'Spanish (Español)',
+              'pt': 'Portuguese (Português)',
+              'ru': 'Russian (Русский)',
+              'ar': 'Arabic (العربية)',
+              'hi': 'Hindi (हिन्दी)',
+              'zh-TW': 'Traditional Chinese (繁體中文)',
+          }
+
+          def translate_readme(content: str, source_lang: str, target_lang: str, model_name: str) -> str:
+              """Translate README content using Vertex AI."""
+              source_name = LANG_NAMES.get(source_lang, source_lang)
+              target_name = LANG_NAMES.get(target_lang, target_lang)
+
+              prompt = f"""You are a professional technical document translator.
+          Translate the following Markdown document from {source_name} to {target_name}.
+
+          RULES:
+          1. Preserve ALL Markdown formatting exactly (headers, links, code blocks, tables, badges, HTML tags).
+          2. Do NOT translate: URLs, code inside backticks or code blocks, GitHub badges, image paths, variable names, or CLI commands.
+          3. Do NOT add any explanation, notes, or commentary. Output ONLY the translated Markdown.
+          4. Maintain the same document structure and line breaks.
+          5. For technical terms that are widely used in their original form (e.g., API, SDK, Docker, Kubernetes), keep them as-is.
+
+          ---
+          {content}
+          """
+              model = GenerativeModel(model_name)
+              response = model.generate_content(
+                  prompt,
+                  generation_config={
+                      "max_output_tokens": 8192,
+                      "temperature": 0.1,
+                  },
+              )
+              return response.text.strip()
+
+          def main():
+              readme_path = "README.md"
+              if not os.path.exists(readme_path):
+                  print("No README.md found, skipping.")
+                  sys.exit(0)
+
+              with open(readme_path, 'r', encoding='utf-8') as f:
+                  content = f.read()
+
+              if not content.strip():
+                  print("README.md is empty, skipping.")
+                  sys.exit(0)
+
+              # Get config from env
+              source_lang = os.environ.get('SOURCE_LANG', 'auto')
+              target_langs = os.environ.get('TARGET_LANGS', 'zh,en').split(',')
+              model_name = os.environ.get('MODEL', 'gemini-2.0-flash')
+              region = os.environ.get('GCP_REGION', 'us-central1')
+
+              # Extract project ID from credentials
+              creds_file = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', '')
+              project_id = None
+              if creds_file and os.path.exists(creds_file):
+                  with open(creds_file, 'r') as f:
+                      creds = json.load(f)
+                      project_id = creds.get('project_id')
+
+              if not project_id:
+                  print("ERROR: Could not determine GCP project ID")
+                  sys.exit(1)
+
+              # Initialize Vertex AI
+              vertexai.init(project=project_id, location=region)
+
+              # Auto-detect source language
+              if source_lang == 'auto':
+                  source_lang = detect_language(content)
+              print(f"Detected source language: {source_lang}")
+
+              # Filter out source language from targets
+              target_langs = [lang.strip() for lang in target_langs if lang.strip() != source_lang]
+
+              if not target_langs:
+                  print("No target languages to translate to (source lang matches all targets).")
+                  sys.exit(0)
+
+              for target_lang in target_langs:
+                  print(f"Translating to {target_lang}...")
+                  try:
+                      translated = translate_readme(content, source_lang, target_lang, model_name)
+                      output_file = f"README-{target_lang}.md"
+                      with open(output_file, 'w', encoding='utf-8') as f:
+                          f.write(translated + '\n')
+                      print(f"  -> Saved to {output_file}")
+                  except Exception as e:
+                      print(f"  -> ERROR translating to {target_lang}: {e}")
+                      continue
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
+          python /tmp/translate_readme.py
+
+      - name: Commit and push translations
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs(i18n): auto-translate README [skip ci]"
+          file_pattern: "README-*.md"
